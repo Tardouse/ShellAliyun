@@ -1,0 +1,108 @@
+name: Release
+
+# 仅当推送 'v' 开头的 tag 时触发 (例如 v0.1.0, v1.2.3)
+on:
+  push:
+    tags:
+      - 'v[0-9]+.*'
+
+jobs:
+  create-release:
+    # 这个任务的唯一目的是创建一个"草稿"Release
+    # 这样所有编译任务才能向同一个Release上传附件
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref_name }}
+          release_name: Release ${{ github.ref_name }}
+          draft: true # 先创建为草稿，等所有附件都上传完毕
+          prerelease: false
+    outputs:
+      # 输出这个草稿Release的上传URL，供后续任务使用
+      upload_url: ${{ steps.create_release.outputs.upload_url }}
+
+  build-and-upload:
+    # 这个任务依赖 create-release 任务
+    needs: create-release
+    # 使用 matrix 策略，同时在 Linux, Windows, macOS 上运行
+    strategy:
+      matrix:
+        include:
+          # 1. Linux (x86_64-unknown-linux-gnu)
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            bin_name: "your_project_name" # <--- !!修改这里!!
+            asset_name: "your_project_name-linux-x86_64"
+
+          # 2. Windows (x86_64-pc-windows-msvc)
+          # 注意：在Windows runner上，我们用MSVC而不是GNU，因为环境预装好了
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin_name: "your_project_name.exe" # <--- !!修改这里!!
+            asset_name: "your_project_name-windows-x86_64.exe"
+
+          # 3. macOS M-series (aarch64-apple-darwin)
+          # macOS runner 默认是 x86_64，但它可以交叉编译到 aarch64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            bin_name: "your_project_name" # <--- !!修改这里!!
+            asset_name: "your_project_name-macos-aarch64"
+            
+          # (可选) 4. macOS Intel (x86_64-apple-darwin)
+          # - os: macos-latest
+          #   target: x86_64-apple-darwin
+          #   bin_name: "your_project_name" # <--- !!修改这里!!
+          #   asset_name: "your_project_name-macos-x86_64"
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }} # 安装对应的 target
+
+      - name: Build binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Prepare artifact path
+        # 确定二进制文件的完整路径
+        id: set-path
+        run: |
+          echo "artifact_path=target/${{ matrix.target }}/release/${{ matrix.bin_name }}" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: Upload Release Asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          # 从上一个任务获取的上传URL
+          upload_url: ${{ needs.create-release.outputs.upload_url }}
+          asset_path: ${{ steps.set-path.outputs.artifact_path }}
+          asset_name: ${{ matrix.asset_name }}
+          asset_content_type: application/octet-stream
+
+  publish-release:
+    # 这个任务在所有 build-and-upload 任务成功后运行
+    needs: [create-release, build-and-upload]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish Release
+        # 这个action使用了 create-release 任务的ID来找到那个草稿
+        # 并将其从 "draft" 状态改为 "published"
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref_name }}
+          release_name: Release ${{ github.ref_name }}
+          draft: false # 设为 false 来正式发布
+          prerelease: false
