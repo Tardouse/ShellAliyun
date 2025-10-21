@@ -11,7 +11,7 @@ jobs:
     # 这个任务的唯一目的是创建一个"草稿"Release
     # 这样所有编译任务才能向同一个Release上传附件
     runs-on: ubuntu-latest
-    permission:
+    permissions:
       contents: write
     steps:
       - name: Create Release
