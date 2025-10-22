@@ -28,7 +28,7 @@ jobs:
             ext: ""
           # macOS ARM (Apple Silicon)
           - os: macos-latest
-            target: arm-apple-darwin
+            target: aarch64-apple-darwin
             ext: ""
 
     steps:
