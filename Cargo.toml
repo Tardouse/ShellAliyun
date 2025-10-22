@@ -22,3 +22,4 @@ clap = { version = "4.0", features = ["derive"] }
 dirs = "4.0"
 which = "4.2.2"
 futures = "0.3"
+indicatif = "0.17"
