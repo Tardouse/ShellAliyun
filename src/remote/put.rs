@@ -10,23 +10,46 @@ use std::{
     task::{Context, Poll},
 };
 use tokio::time::{sleep, Duration};
+use futures::Stream;
 
 /// Each part size (500 MB, up to 5 GB allowed by Aliyun)
 const PART_SIZE: usize = 500 * 1024 * 1024;
 
-/// A reader wrapper that reports progress as it reads bytes
-struct ProgressReader<R: Read> {
-    inner: R,
+/// 支持进度追踪的字节流
+struct ProgressStream {
+    data: Vec<u8>,
+    position: usize,
     progress: ProgressBar,
-    total_read: u64,
+    chunk_size: usize,
 }
 
-impl<R: Read> Read for ProgressReader<R> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let n = self.inner.read(buf)?;
-        self.total_read += n as u64;
-        self.progress.inc(n as u64);
-        Ok(n)
+impl ProgressStream {
+    fn new(data: Vec<u8>, progress: ProgressBar) -> Self {
+        Self {
+            data,
+            position: 0,
+            progress,
+            chunk_size: 8192,
+        }
+    }
+}
+
+impl Stream for ProgressStream {
+    type Item = Result<Vec<u8>, std::io::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.position >= self.data.len() {
+            return Poll::Ready(None);
+        }
+
+        let end = (self.position + self.chunk_size).min(self.data.len());
+        let chunk = self.data[self.position..end].to_vec();
+        self.position = end;
+        
+        // 更新进度条
+        self.progress.inc(chunk.len() as u64);
+
+        Poll::Ready(Some(Ok(chunk)))
     }
 }
 
@@ -92,16 +115,13 @@ pub async fn put_file(
         return Ok(());
     }
 
-    println!(
-        "📦 FileID: {}, UploadID: {}, Parts: {}",
-        file_id, upload_id, parts.len()
-    );
+    println!("📦 FileID: {}, UploadID: {}", file_id, upload_id);
 
-    // 2️⃣ Global progress bar
+    // 2️⃣ 创建全局进度条 - 显示整体上传进度
     let pb = ProgressBar::new(file_size);
     pb.set_style(
         ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({percent}%) | {bytes_per_sec} | ETA: {eta}")
             .unwrap()
             .progress_chars("=>-"),
     );
@@ -116,43 +136,49 @@ pub async fn put_file(
         let end = ((i + 1) * PART_SIZE).min(file_size as usize) as u64;
         let chunk_size = (end - start) as usize;
 
+        // 读取分片数据
         file.seek(SeekFrom::Start(start))?;
         let mut buf = vec![0u8; chunk_size];
         file.read_exact(&mut buf)?;
 
         let mut retry_count = 0;
         loop {
-            println!(
-                "🚀 Uploading part {}/{} ({} MB)...",
-                i + 1,
-                parts.len(),
-                chunk_size / 1024 / 1024
-            );
+            // 创建进度追踪流
+            let stream = ProgressStream::new(buf.clone(), pb.clone());
+            let body = Body::wrap_stream(stream);
 
-            // Wrap the buffer in a progress-tracking reader
-            let reader = ProgressReader {
-                inner: std::io::Cursor::new(buf.clone()),
-                progress: pb.clone(),
-                total_read: 0,
-            };
-            let body = Body::from(buf.clone());
-
-            let put_res = client.put(upload_url).body(body).send().await;
+            let put_res = client
+                .put(upload_url)
+                .header("Content-Length", chunk_size.to_string())
+                .body(body)
+                .send()
+                .await;
 
             match put_res {
-                Ok(r) if r.status().is_success() => break,
+                Ok(r) if r.status().is_success() => {
+                    break;
+                }
                 Ok(r) if r.status().as_u16() == 403 && retry_count < 3 => {
+                    // 回退进度条（因为这次上传失败了）
+                    pb.set_position(pb.position().saturating_sub(chunk_size as u64));
                     eprintln!("⚠️ Concurrency limit hit, retrying in 3 s...");
                     retry_count += 1;
                     sleep(Duration::from_secs(3)).await;
                 }
-                Ok(r) => return Err(anyhow!("Part {} upload failed: {}", part_number, r.text().await?)),
+                Ok(r) => {
+                    pb.set_position(pb.position().saturating_sub(chunk_size as u64));
+                    return Err(anyhow!("Part {} upload failed: {}", part_number, r.text().await?));
+                }
                 Err(e) if retry_count < 3 => {
+                    pb.set_position(pb.position().saturating_sub(chunk_size as u64));
                     eprintln!("⚠️ Network error: {}, retrying in 3 s...", e);
                     retry_count += 1;
                     sleep(Duration::from_secs(3)).await;
                 }
-                Err(e) => return Err(anyhow!("Upload failed: {}", e)),
+                Err(e) => {
+                    pb.set_position(pb.position().saturating_sub(chunk_size as u64));
+                    return Err(anyhow!("Upload failed: {}", e));
+                }
             }
         }
     }
@@ -176,8 +202,8 @@ pub async fn put_file(
     let status = res2.status();
     let text = res2.text().await?;
     if status.is_success() {
-        pb.finish_with_message("🎉 File uploaded successfully!");
-        println!("✅ Upload success: {}", text);
+        println!("🎉 File uploaded successfully!");
+        println!("✅ Upload success!");
     } else {
         return Err(anyhow!("Upload completion failed: {}", text));
     }
