@@ -595,9 +595,19 @@ impl Completer for AliyunCompleter {
         let mut remote_cache: Option<Vec<RemoteEntry>> = None;
         let mut ensure_remote = || {
             if remote_cache.is_none() {
-                if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    let parent_id = self.remote_cwd.blocking_lock().clone();
-                    if let Ok(entries) = handle.block_on(fetch_remote_entries(parent_id)) {
+                // 克隆 Arc 以便在新线程中使用
+                let remote_cwd_clone = Arc::clone(&self.remote_cwd);
+                
+                // 在新线程中执行所有操作，避免阻塞主运行时
+                if let Ok(result) = std::thread::spawn(move || {
+                    // 在新线程中可以安全使用 blocking_lock
+                    let parent_id = remote_cwd_clone.blocking_lock().clone();
+                    
+                    // 创建新的运行时
+                    let rt = tokio::runtime::Runtime::new().ok()?;
+                    rt.block_on(fetch_remote_entries(parent_id)).ok()
+                }).join() {
+                    if let Some(entries) = result {
                         remote_cache = Some(entries);
                     }
                 }
