@@ -1,55 +1,38 @@
-name: Release
+name: Build & Release Aliyun CLI
 
 on:
   push:
     tags:
-      - 'v[0-9]+.*'
+      - "v*"   # 当推送版本标签时自动发布
+  pull_request:
+  workflow_dispatch:
 
 jobs:
-  create-release:
-    name: Create Draft Release
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write # 必需：允许 gh 创建 release
-    steps:
-      - name: Create Draft Release
-        run: |
-          gh release create ${{ github.ref_name }} \
-            --draft \
-            --title "Release ${{ github.ref_name }}" \
-            --notes "Draft release for ${{ github.ref_name }}"
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  build-and-upload:
-    name: Build and Upload Assets
-    needs: create-release
-    permissions:
-      contents: write # 必需：允许 gh 上传附件
+  build:
+    name: Build for ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         include:
-          # 1. Linux (x86_64-unknown-linux-gnu)
+          # Linux (musl 静态链接)
           - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            bin_name: "aliyuncli" # <--- !!修改这里!!
-            asset_name: "aliyuncli-linux-x86_64"
-
-          # 2. Windows (x86_64-pc-windows-msvc)
+            target: x86_64-unknown-linux-musl
+            ext: ""
+          # Windows
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            bin_name: "aliyuncli.exe" # <--- !!修改这里!!
-            asset_name: "aliyuncli-windows-x86_64.exe"
-
-          # 3. macOS M-series (aarch64-apple-darwin)
+            ext: ".exe"
+          # macOS Intel
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            ext: ""
+          # macOS ARM (Apple Silicon)
           - os: macos-latest
             target: aarch64-apple-darwin
-            bin_name: "aliyuncli" # <--- !!修改这里!!
-            asset_name: "aliyuncli-macos-aarch64"
+            ext: ""
 
-    runs-on: ${{ matrix.os }}
     steps:
-      - name: Checkout repository
+      - name: Checkout source
         uses: actions/checkout@v4
 
       - name: Install Rust toolchain
@@ -57,38 +40,55 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Build binary
+      - name: Install musl tools (for Linux)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          rustup target add x86_64-unknown-linux-musl
+
+      - name: Enable static CRT for Windows
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        run: echo "RUSTFLAGS=-C target-feature=+crt-static" >> $env:GITHUB_ENV
+
+      - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Prepare artifact path
-        id: set-path
-        run: echo "artifact_path=target/${{ matrix.target }}/release/${{ matrix.bin_name }}" >> $GITHUB_OUTPUT
-        shell: bash
-      
-      # (推荐) 重命名文件，使其在Release页面上更清晰
-      - name: Rename artifact (Linux/macOS)
-        if: runner.os != 'Windows'
-        run: mv ${{ steps.set-path.outputs.artifact_path }} ${{ matrix.asset_name }}
-        shell: bash
+      - name: Package artifact
+        run: |
+          mkdir dist
+          cp target/${{ matrix.target }}/release/aliyuncli${{ matrix.ext }} dist/
+          cd dist
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            powershell Compress-Archive aliyuncli${{ matrix.ext }} aliyuncli-${{ matrix.target }}.zip
+          else
+            tar -czf aliyuncli-${{ matrix.target }}.tar.gz aliyuncli${{ matrix.ext }}
+          fi
 
-      - name: Rename artifact (Windows)
-        if: runner.os == 'Windows'
-        run: mv ${{ steps.set-path.outputs.artifact_path }} ${{ matrix.asset_name }}
-        shell: pwsh
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aliyuncli-${{ matrix.target }}
+          path: dist/*
 
-      - name: Upload Release Asset
-        run: gh release upload ${{ github.ref_name }} ${{ matrix.asset_name }} --clobber
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  publish-release:
+  release:
     name: Publish Release
-    needs: [create-release, build-and-upload]
     runs-on: ubuntu-latest
-    permissions:
-      contents: write # 必需：允许 gh 编辑 release（将其从草稿变为发布）
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
     steps:
-      - name: Publish Release
-        run: gh release edit ${{ github.ref_name }} --draft=false
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Display artifacts
+        run: ls -R dist
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/**/*.{zip,tar.gz}
+          generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
