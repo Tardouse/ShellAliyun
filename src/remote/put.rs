@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use futures::Stream;
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::{Body, Client};
 use serde_json::{json, Value};
@@ -10,7 +11,6 @@ use std::{
     task::{Context, Poll},
 };
 use tokio::time::{sleep, Duration};
-use futures::Stream;
 
 /// Each part size (500 MB, up to 5 GB allowed by Aliyun)
 const PART_SIZE: usize = 500 * 1024 * 1024;
@@ -45,7 +45,7 @@ impl Stream for ProgressStream {
         let end = (self.position + self.chunk_size).min(self.data.len());
         let chunk = self.data[self.position..end].to_vec();
         self.position = end;
-        
+
         // 更新进度条
         self.progress.inc(chunk.len() as u64);
 
@@ -71,11 +71,16 @@ pub async fn put_file(
     let mut file = File::open(path)?;
     let file_size = file.metadata()?.len();
 
-    println!("🟢 Starting upload: {} ({} MB)", filename, file_size / 1024 / 1024);
+    println!(
+        "🟢 Starting upload: {} ({} MB)",
+        filename,
+        file_size / 1024 / 1024
+    );
 
     let part_count = ((file_size as f64) / (PART_SIZE as f64)).ceil() as usize;
-    let part_info_list: Vec<Value> =
-        (1..=part_count).map(|i| json!({ "part_number": i })).collect();
+    let part_info_list: Vec<Value> = (1..=part_count)
+        .map(|i| json!({ "part_number": i }))
+        .collect();
 
     // 1️⃣ Create upload session
     let create_url = "https://openapi.alipan.com/adrive/v1.0/openFile/create";
@@ -105,10 +110,7 @@ pub async fn put_file(
 
     let file_id = v["file_id"].as_str().unwrap_or_default().to_string();
     let upload_id = v["upload_id"].as_str().unwrap_or_default().to_string();
-    let parts = v["part_info_list"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
+    let parts = v["part_info_list"].as_array().cloned().unwrap_or_default();
 
     if v["rapid_upload"].as_bool().unwrap_or(false) {
         println!("⚡ Rapid upload detected, skipping transfer.");
@@ -167,7 +169,11 @@ pub async fn put_file(
                 }
                 Ok(r) => {
                     pb.set_position(pb.position().saturating_sub(chunk_size as u64));
-                    return Err(anyhow!("Part {} upload failed: {}", part_number, r.text().await?));
+                    return Err(anyhow!(
+                        "Part {} upload failed: {}",
+                        part_number,
+                        r.text().await?
+                    ));
                 }
                 Err(e) if retry_count < 3 => {
                     pb.set_position(pb.position().saturating_sub(chunk_size as u64));

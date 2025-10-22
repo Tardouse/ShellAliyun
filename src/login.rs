@@ -21,6 +21,7 @@ fn generate_code_verifier_and_challenge() -> (String, String) {
 }
 
 #[derive(Deserialize, Debug)]
+#[allow(dead_code)]
 struct TokenResponse {
     token_type: String,
     access_token: String,

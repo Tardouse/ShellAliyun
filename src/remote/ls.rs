@@ -3,6 +3,15 @@ use colored::Colorize;
 use reqwest::Client;
 use serde::Deserialize;
 
+#[derive(Clone, Debug, Default)]
+pub struct ListOptions {
+    pub limit: Option<u32>,
+    pub marker: Option<String>,
+    pub order_by: Option<String>,
+    pub order_direction: Option<String>,
+    pub fetch_all: bool,
+}
+
 #[derive(Deserialize, Debug)]
 struct FileListResponse {
     items: Vec<FileItem>,
@@ -16,6 +25,7 @@ pub struct FileItem {
     #[serde(rename = "type")]
     pub kind: String,
     pub size: Option<u64>,
+    #[allow(dead_code)]
     pub updated_at: Option<String>,
 }
 
@@ -25,16 +35,38 @@ async fn request_file_list(
     token: &str,
     drive_id: &str,
     parent_file_id: &str,
+    limit: Option<u32>,
+    marker: Option<String>,
+    order_by: Option<&str>,
+    order_direction: Option<&str>,
 ) -> Result<FileListResponse> {
     let url = "https://openapi.alipan.com/adrive/v1.0/openFile/list";
 
-    let body = serde_json::json!({
-        "drive_id": drive_id,
-        "limit": 100,
-        "parent_file_id": parent_file_id,
-        "order_by": "name_enhanced",
-        "order_direction": "ASC",
-    });
+    let mut body = serde_json::Map::new();
+    body.insert(
+        "drive_id".to_string(),
+        serde_json::Value::String(drive_id.to_string()),
+    );
+    body.insert(
+        "parent_file_id".to_string(),
+        serde_json::Value::String(parent_file_id.to_string()),
+    );
+    body.insert(
+        "limit".to_string(),
+        serde_json::Value::Number(serde_json::Number::from(limit.unwrap_or(100))),
+    );
+    body.insert(
+        "order_by".to_string(),
+        serde_json::Value::String(order_by.unwrap_or("name_enhanced").to_string()),
+    );
+    body.insert(
+        "order_direction".to_string(),
+        serde_json::Value::String(order_direction.unwrap_or("ASC").to_string()),
+    );
+
+    if let Some(marker) = marker.filter(|m| !m.is_empty()) {
+        body.insert("marker".to_string(), serde_json::Value::String(marker));
+    }
 
     let client = Client::new();
     let res = client
@@ -54,24 +86,58 @@ async fn request_file_list(
 
 /// 获取远程文件列表并打印结果（带中英提示）。
 /// List remote files and print them with bilingual hints.
-pub async fn list_remote_files(token: &str, drive_id: &str, parent_file_id: &str) -> Result<()> {
-    let resp = request_file_list(token, drive_id, parent_file_id).await?;
-    if resp.items.is_empty() {
-        println!("{}", "(empty)".dimmed());
-        return Ok(());
-    }
+pub async fn list_remote_files(
+    token: &str,
+    drive_id: &str,
+    parent_file_id: &str,
+    options: &ListOptions,
+) -> Result<()> {
+    let mut marker = options.marker.clone();
+    let mut first_page = true;
 
-    for item in resp.items {
-        if item.kind == "folder" {
-            println!("{}/", item.name.blue());
+    loop {
+        let resp = request_file_list(
+            token,
+            drive_id,
+            parent_file_id,
+            options.limit,
+            marker.clone(),
+            options.order_by.as_deref(),
+            options.order_direction.as_deref(),
+        )
+        .await?;
+
+        if resp.items.is_empty() {
+            if first_page {
+                println!("{}", "(empty)".dimmed());
+            }
         } else {
-            let size = item.size.unwrap_or(0);
-            println!("{:<40} {:>10} bytes", item.name, size);
+            for item in &resp.items {
+                if item.kind == "folder" {
+                    println!("{}/", item.name.blue());
+                } else {
+                    let size = item.size.unwrap_or(0);
+                    println!("{:<40} {:>10} bytes", item.name, size);
+                }
+            }
         }
-    }
 
-    if let Some(marker) = resp.next_marker {
-        println!("Next marker: {}", marker.dimmed());
+        first_page = false;
+
+        if options.fetch_all {
+            match resp.next_marker.filter(|m| !m.is_empty()) {
+                Some(next) => {
+                    marker = Some(next);
+                    continue;
+                }
+                None => break,
+            }
+        } else {
+            if let Some(marker) = resp.next_marker.filter(|m| !m.is_empty()) {
+                println!("Next marker: {}", marker.dimmed());
+            }
+            break;
+        }
     }
 
     Ok(())
@@ -85,7 +151,7 @@ pub async fn get_subfolder_id(
     parent_file_id: &str,
     folder_name: &str,
 ) -> Result<Option<String>> {
-    let resp = request_file_list(token, drive_id, parent_file_id).await?;
+    let resp = request_file_list(token, drive_id, parent_file_id, None, None, None, None).await?;
     for item in resp.items {
         if item.kind == "folder" && item.name == folder_name {
             return Ok(Some(item.file_id));
@@ -103,7 +169,7 @@ pub async fn find_file_id_by_name(
     parent_file_id: &str,
     filename: &str,
 ) -> Result<String> {
-    let resp = request_file_list(token, drive_id, parent_file_id).await?;
+    let resp = request_file_list(token, drive_id, parent_file_id, None, None, None, None).await?;
     for item in resp.items {
         if item.name == filename {
             return Ok(item.file_id);

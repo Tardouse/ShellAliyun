@@ -45,7 +45,12 @@ pub async fn get_file(
     // 3️⃣ 获取下载链接
     let url = "https://openapi.alipan.com/adrive/v1.0/openFile/getDownloadUrl";
     let body = json!({ "drive_id": drive_id, "file_id": file_id });
-    let res = client.post(url).bearer_auth(token).json(&body).send().await?;
+    let res = client
+        .post(url)
+        .bearer_auth(token)
+        .json(&body)
+        .send()
+        .await?;
     let v: serde_json::Value = res.json().await?;
     let dl_url = v["url"]
         .as_str()
@@ -62,8 +67,11 @@ pub async fn get_file(
     );
 
     // 5️⃣ 打开/创建目标文件（断点续传）
-    let mut file = OpenOptions::new().create(true).write(true).open(local_path)?;
-    let mut downloaded = file.metadata()?.len();
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(local_path)?;
+    let downloaded = file.metadata()?.len();
     if downloaded > 0 && downloaded < total_size {
         file.seek(SeekFrom::Start(downloaded))?;
         pb.set_position(downloaded);

@@ -13,7 +13,8 @@ mod remote;
 use login::{check_login, oauth_login};
 use remote::{
     drive::get_drive_id,
-    ls::{get_subfolder_id, list_remote_files},
+    ls::{get_subfolder_id, list_remote_files, ListOptions},
+    search::{search_files, SearchOptions},
 };
 
 #[tokio::main]
@@ -130,6 +131,7 @@ impl Shell {
             "cp" => self.cmd_cp(parts).await?,
             "mv" => self.cmd_mv(parts).await?,
             "rm" => self.cmd_rm(parts).await?,
+            "search" => self.cmd_search(parts).await?,
             _ => println!("Unknown command: {}", cmd),
         }
         Ok(())
@@ -164,14 +166,194 @@ impl Shell {
     /// 处理 `ls` 命令，支持可选路径（相对或绝对）。
     async fn cmd_ls(&mut self, args: Vec<String>) -> Result<()> {
         let (token, drive_id) = self.ensure_auth().await?;
-        let target = args.get(0).map(|s| s.as_str()).unwrap_or(".");
+
+        let mut options = ListOptions::default();
+        let mut path: Option<String> = None;
+        let mut iter = args.into_iter();
+
+        while let Some(arg) = iter.next() {
+            match arg.as_str() {
+                "--limit" => {
+                    let value = iter
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("--limit requires a value"))?;
+                    let parsed: u32 = value
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("Invalid --limit value: {}", value))?;
+                    if parsed == 0 || parsed > 100 {
+                        anyhow::bail!("--limit must be between 1 and 100");
+                    }
+                    options.limit = Some(parsed);
+                }
+                "--marker" => {
+                    let marker = iter
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("--marker requires a value"))?;
+                    options.marker = Some(marker);
+                }
+                "--order-by" => {
+                    let value = iter
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("--order-by requires a value"))?;
+                    let valid = ["created_at", "updated_at", "name", "size", "name_enhanced"];
+                    if !valid.contains(&value.as_str()) {
+                        anyhow::bail!(
+                            "Unsupported --order-by value: {} (allowed: created_at, updated_at, name, size, name_enhanced)",
+                            value
+                        );
+                    }
+                    options.order_by = Some(value);
+                }
+                "--order-direction" => {
+                    let value = iter
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("--order-direction requires a value"))?;
+                    let upper = value.to_ascii_uppercase();
+                    if upper != "ASC" && upper != "DESC" {
+                        anyhow::bail!("--order-direction must be ASC or DESC");
+                    }
+                    options.order_direction = Some(upper);
+                }
+                "--all" | "-a" => {
+                    options.fetch_all = true;
+                }
+                arg if arg.starts_with('-') => {
+                    anyhow::bail!("Unknown option for ls: {}", arg);
+                }
+                arg => {
+                    if path.is_some() {
+                        anyhow::bail!("Multiple paths provided to ls: {}", arg);
+                    }
+                    path = Some(arg.to_string());
+                }
+            }
+        }
+
+        let target = path.as_deref().unwrap_or(".");
         let parent_id = if target == "." {
             self.remote_cwd.clone()
         } else {
             self.resolve_remote_parent(&token, &drive_id, target)
                 .await?
         };
-        list_remote_files(&token, &drive_id, &parent_id).await
+
+        list_remote_files(&token, &drive_id, &parent_id, &options).await
+    }
+
+    async fn cmd_search(&mut self, args: Vec<String>) -> Result<()> {
+        if args.is_empty() {
+            anyhow::bail!(
+                "Usage: search <keyword> [options]\nUse --query for advanced expressions."
+            );
+        }
+
+        let (token, drive_id) = self.ensure_auth().await?;
+
+        let mut options = SearchOptions::default();
+        let mut keyword: Option<String> = None;
+        let mut raw_query: Option<String> = None;
+        let mut global = false;
+        let mut target_path: Option<String> = None;
+        let mut iter = args.into_iter();
+
+        while let Some(arg) = iter.next() {
+            match arg.as_str() {
+                "--limit" => {
+                    let value = iter
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("--limit requires a value"))?;
+                    let parsed: u32 = value
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("Invalid --limit value: {}", value))?;
+                    if parsed == 0 || parsed > 100 {
+                        anyhow::bail!("--limit must be between 1 and 100");
+                    }
+                    options.limit = Some(parsed);
+                }
+                "--marker" => {
+                    let marker = iter
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("--marker requires a value"))?;
+                    options.marker = Some(marker);
+                }
+                "--order-by" => {
+                    let value = iter
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("--order-by requires a value"))?;
+                    let valid = ["created_at", "updated_at", "name", "size"];
+                    if !valid.contains(&value.as_str()) {
+                        anyhow::bail!(
+                            "Unsupported --order-by value: {} (allowed: created_at, updated_at, name, size)",
+                            value
+                        );
+                    }
+                    options.order_by = Some(value);
+                }
+                "--order-direction" => {
+                    let value = iter
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("--order-direction requires a value"))?;
+                    let upper = value.to_ascii_uppercase();
+                    if upper != "ASC" && upper != "DESC" {
+                        anyhow::bail!("--order-direction must be ASC or DESC");
+                    }
+                    options.order_direction = Some(upper);
+                }
+                "--return-total" => options.return_total_count = true,
+                "--all" | "-a" => options.fetch_all = true,
+                "--global" => global = true,
+                "--in" | "--path" => {
+                    let value = iter
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("--in requires a value"))?;
+                    target_path = Some(value);
+                }
+                "--query" => {
+                    let value = iter
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("--query requires a value"))?;
+                    raw_query = Some(value);
+                }
+                arg if arg.starts_with('-') => {
+                    anyhow::bail!("Unknown option for search: {}", arg);
+                }
+                arg => {
+                    if raw_query.is_some() {
+                        anyhow::bail!("Cannot mix --query with positional keyword");
+                    }
+                    if keyword.is_some() {
+                        anyhow::bail!("Multiple keywords provided to search: {}", arg);
+                    }
+                    keyword = Some(arg.to_string());
+                }
+            }
+        }
+
+        let query = if let Some(q) = raw_query {
+            q
+        } else {
+            let keyword = keyword.ok_or_else(|| {
+                anyhow::anyhow!("Usage: search <keyword> [options] or search --query <expr>")
+            })?;
+            let escaped_keyword = keyword.replace('"', "\\\"");
+            if global {
+                format!("name match \"{}\"", escaped_keyword)
+            } else {
+                let folder_target = target_path.as_deref().unwrap_or(".");
+                let folder_id = if folder_target == "." {
+                    self.remote_cwd.clone()
+                } else {
+                    self.resolve_remote_parent(&token, &drive_id, folder_target)
+                        .await?
+                };
+                format!(
+                    "parent_file_id = '{}' and name match \"{}\"",
+                    folder_id, escaped_keyword
+                )
+            }
+        };
+
+        search_files(&token, &drive_id, &query, &options).await
     }
 
     async fn cmd_cd(&mut self, parts: Vec<String>) -> Result<()> {
@@ -191,6 +373,7 @@ impl Shell {
         println!("  ls [path]         Remote listing (支持相对/绝对路径)");
         println!("  cd <path>         Remote navigation (支持..与绝对路径)");
         println!("  pwd               Show remote cwd");
+        println!("  search <keyword>  Search files (支持 --global/--limit/--all 等)");
         println!("  put <file>         Upload file");
         println!("  get <name> [path]  Download file");
         println!("  cp <name> <to>     Copy remote file");
@@ -563,7 +746,7 @@ impl Completer for AliyunCompleter {
         _ctx: &Context<'_>,
     ) -> rustyline::Result<(usize, Vec<Pair>)> {
         let cmds = vec![
-            "ls", "cd", "put", "get", "cp", "mv", "rm", "lls", "lcd", "help", "exit",
+            "ls", "cd", "put", "get", "cp", "mv", "rm", "lls", "lcd", "search", "help", "exit",
         ];
         let input = &line[..pos];
         let mut parts: Vec<&str> = input.split_whitespace().collect();
@@ -597,16 +780,18 @@ impl Completer for AliyunCompleter {
             if remote_cache.is_none() {
                 // 克隆 Arc 以便在新线程中使用
                 let remote_cwd_clone = Arc::clone(&self.remote_cwd);
-                
+
                 // 在新线程中执行所有操作，避免阻塞主运行时
                 if let Ok(result) = std::thread::spawn(move || {
                     // 在新线程中可以安全使用 blocking_lock
                     let parent_id = remote_cwd_clone.blocking_lock().clone();
-                    
+
                     // 创建新的运行时
                     let rt = tokio::runtime::Runtime::new().ok()?;
                     rt.block_on(fetch_remote_entries(parent_id)).ok()
-                }).join() {
+                })
+                .join()
+                {
                     if let Some(entries) = result {
                         remote_cache = Some(entries);
                     }
