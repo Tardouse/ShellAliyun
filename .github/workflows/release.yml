@@ -54,16 +54,20 @@ jobs:
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Package artifact
+      - name: Package artifact (Windows)
+        if: runner.os == 'Windows'
         run: |
           mkdir dist
+          Copy-Item target\${{ matrix.target }}\release\aliyuncli${{ matrix.ext }} dist\
+          Compress-Archive dist\aliyuncli${{ matrix.ext }} dist\aliyuncli-${{ matrix.target }}.zip
+
+      - name: Package artifact (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist
           cp target/${{ matrix.target }}/release/aliyuncli${{ matrix.ext }} dist/
           cd dist
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            powershell Compress-Archive aliyuncli${{ matrix.ext }} aliyuncli-${{ matrix.target }}.zip
-          else
-            tar -czf aliyuncli-${{ matrix.target }}.tar.gz aliyuncli${{ matrix.ext }}
-          fi
+          tar -czf aliyuncli-${{ matrix.target }}.tar.gz aliyuncli${{ matrix.ext }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
