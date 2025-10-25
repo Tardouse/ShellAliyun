@@ -2,6 +2,11 @@
 
 ShellAliyun 是一个使用 Rust 编写的命令行工具，类似`SFTP`，旨在通过终端与阿里云盘进行交互。它提供登录鉴权、目录导航、文件传输等常用能力，让偏好命令行的用户能够高效地管理云端文件。
 
+## demo
+
+![](https://picture-for-upload.oss-cn-beijing.aliyuncs.com/markdown/demo-20251025105404.gif)
+
+
 ## 功能特性
 
 - **OAuth 登录**：通过本地浏览器登录，方便在本地通过ssh远程到服务器使用。
