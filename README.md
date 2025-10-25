@@ -12,16 +12,16 @@ ShellAliyun 是一个使用 Rust 编写的命令行工具，类似`SFTP`，旨�
 - **远程搜索**：新增 `search` 指令，可在当前目录或全局范围内按名称模糊查找文件，支持分页与统计总数。
 - **命令补全**：内置基于 rustyline 的补全器，能够根据当前远程目录给出提示。
 
-## 环境要求
-
-- Rust 1.74 或更高版本（建议使用最新稳定版）。
-- 已安装 Cargo 构建工具。
-
 ## 安装
 - 从release 下载对应的最新版本
 - 将其添加到的环境变量中
 
 ## 编译
+
+### 环境要求
+
+- Rust 1.74 或更高版本（建议使用最新稳定版）。
+- 已安装 Cargo 构建工具。
 
 ```bash
 git clone https://github.com/Tardouse/ShellAliyun.git
