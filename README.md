@@ -4,7 +4,7 @@ ShellAliyun 是一个使用 Rust 编写的命令行工具，类似`SFTP`，旨�
 
 ## demo
 
-<video src="https://picture-for-upload.oss-cn-beijing.aliyuncs.com/videos/shellaliyundemo.mp4" width="640" autoplay loop muted></video>
+<https://picture-for-upload.oss-cn-beijing.aliyuncs.com/videos/shellaliyundemo.mp4>
 
 
 ## 功能特性
