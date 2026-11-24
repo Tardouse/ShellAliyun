@@ -1,218 +1,237 @@
-use anyhow::{anyhow, Result};
-use futures::Stream;
-use indicatif::{ProgressBar, ProgressStyle};
-use reqwest::{Body, Client};
-use serde_json::{json, Value};
-use std::{
+use super::{progress, retry_delay, retry_status, Drive, ATTEMPTS};
+use anyhow::{bail, Context, Result};
+use futures::TryStreamExt;
+use indicatif::ProgressBar;
+use reqwest::{header::CONTENT_LENGTH, Body, Client, Url};
+use serde::Deserialize;
+use serde_json::json;
+use std::{io::SeekFrom, path::Path};
+use tokio::{
     fs::File,
-    io::{Read, Seek, SeekFrom},
-    path::Path,
-    pin::Pin,
-    task::{Context, Poll},
+    io::{AsyncReadExt, AsyncSeekExt},
 };
-use tokio::time::{sleep, Duration};
+use tokio_util::io::ReaderStream;
 
-/// Each part size (500 MB, up to 5 GB allowed by Aliyun)
-const PART_SIZE: usize = 500 * 1024 * 1024;
+const PART_SIZE: u64 = 500 * 1024 * 1024;
+const MAX_PARTS: u64 = 10_000;
 
-/// 支持进度追踪的字节流
-struct ProgressStream {
-    data: Vec<u8>,
-    position: usize,
-    progress: ProgressBar,
-    chunk_size: usize,
+#[derive(Deserialize)]
+struct Upload {
+    file_id: String,
+    name: Option<String>,
+    file_name: Option<String>,
+    upload_id: Option<String>,
+    #[serde(default)]
+    rapid_upload: bool,
+    #[serde(default)]
+    part_info_list: Vec<Part>,
 }
 
-impl ProgressStream {
-    fn new(data: Vec<u8>, progress: ProgressBar) -> Self {
-        Self {
-            data,
-            position: 0,
-            progress,
-            chunk_size: 8192,
+#[derive(Deserialize)]
+struct Part {
+    part_number: u64,
+    upload_url: Url,
+}
+
+impl Drive<'_> {
+    pub async fn upload(&self, parent: &str, name: &str, local: &Path) -> Result<String> {
+        let metadata = tokio::fs::metadata(local)
+            .await
+            .with_context(|| format!("inspect {}", local.display()))?;
+        if !metadata.is_file() {
+            bail!("Local path is not a regular file: {}", local.display());
         }
-    }
-}
-
-impl Stream for ProgressStream {
-    type Item = Result<Vec<u8>, std::io::Error>;
-
-    fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        if self.position >= self.data.len() {
-            return Poll::Ready(None);
+        let mut file = File::open(local)
+            .await
+            .with_context(|| format!("open {}", local.display()))?;
+        let metadata = file.metadata().await?;
+        if !metadata.is_file() {
+            bail!("Local path is not a regular file: {}", local.display());
+        }
+        let size = metadata.len();
+        let count = size.div_ceil(PART_SIZE).max(1);
+        if count > MAX_PARTS {
+            bail!("File exceeds the upload limit of {MAX_PARTS} parts");
         }
 
-        let end = (self.position + self.chunk_size).min(self.data.len());
-        let chunk = self.data[self.position..end].to_vec();
-        self.position = end;
+        let mut upload: Upload = self.call("create", json!({
+            "drive_id": self.id,
+            "parent_file_id": parent,
+            "name": name,
+            "type": "file",
+            "check_name_mode": "auto_rename",
+            "size": size,
+            "part_info_list": (1..=count).map(|n| json!({"part_number": n})).collect::<Vec<_>>(),
+        })).await?;
+        if upload.file_id.is_empty() {
+            bail!("Create upload returned no file ID");
+        }
+        if upload.rapid_upload {
+            return Ok(upload
+                .file_name
+                .or(upload.name)
+                .unwrap_or_else(|| name.to_owned()));
+        }
+        let upload_id = upload
+            .upload_id
+            .filter(|id| !id.is_empty())
+            .context("Missing upload ID")?;
+        upload
+            .part_info_list
+            .sort_unstable_by_key(|part| part.part_number);
+        let zero_parts = size == 0 && upload.part_info_list.is_empty();
+        let expected_parts = upload.part_info_list.len() as u64 == count
+            && upload
+                .part_info_list
+                .iter()
+                .zip(1..)
+                .all(|(part, n)| part.part_number == n);
+        if !zero_parts && !expected_parts {
+            bail!("Aliyun Drive returned an incomplete or invalid list of upload parts");
+        }
 
-        // 更新进度条
-        self.progress.inc(chunk.len() as u64);
-
-        Poll::Ready(Some(Ok(chunk)))
-    }
-}
-
-/// Upload file with real-time progress bar
-pub async fn put_file(
-    token: &str,
-    drive_id: &str,
-    parent_file_id: &str,
-    local_path: &str,
-) -> Result<()> {
-    let client = Client::new();
-    let path = Path::new(local_path);
-    let filename = path
-        .file_name()
-        .ok_or_else(|| anyhow!("Invalid filename"))?
-        .to_string_lossy()
-        .to_string();
-
-    let mut file = File::open(path)?;
-    let file_size = file.metadata()?.len();
-
-    println!(
-        "🟢 Starting upload: {} ({} MB)",
-        filename,
-        file_size / 1024 / 1024
-    );
-
-    let part_count = ((file_size as f64) / (PART_SIZE as f64)).ceil() as usize;
-    let part_info_list: Vec<Value> = (1..=part_count)
-        .map(|i| json!({ "part_number": i }))
-        .collect();
-
-    // 1️⃣ Create upload session
-    let create_url = "https://openapi.alipan.com/adrive/v1.0/openFile/create";
-    let body = json!({
-        "drive_id": drive_id,
-        "parent_file_id": parent_file_id,
-        "name": filename,
-        "type": "file",
-        "check_name_mode": "auto_rename",
-        "part_info_list": part_info_list,
-        "size": file_size,
-        "content_hash_name": "sha1",
-        "proof_version": "v1"
-    });
-
-    let res = client
-        .post(create_url)
-        .bearer_auth(token)
-        .json(&body)
-        .send()
-        .await?;
-    let resp_text = res.text().await?;
-    let v: Value = serde_json::from_str(&resp_text)?;
-    if let Some(code) = v.get("code") {
-        return Err(anyhow!("Failed to create file: {}", code));
-    }
-
-    let file_id = v["file_id"].as_str().unwrap_or_default().to_string();
-    let upload_id = v["upload_id"].as_str().unwrap_or_default().to_string();
-    let parts = v["part_info_list"].as_array().cloned().unwrap_or_default();
-
-    if v["rapid_upload"].as_bool().unwrap_or(false) {
-        println!("⚡ Rapid upload detected, skipping transfer.");
-        return Ok(());
-    }
-
-    println!("📦 FileID: {}, UploadID: {}", file_id, upload_id);
-
-    // 2️⃣ 创建全局进度条 - 显示整体上传进度
-    let pb = ProgressBar::new(file_size);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({percent}%) | {bytes_per_sec} | ETA: {eta}")
-            .unwrap()
-            .progress_chars("=>-"),
-    );
-
-    // 3️⃣ Upload parts with live progress
-    for (i, part) in parts.iter().enumerate() {
-        let upload_url = part["upload_url"]
+        let progress = progress(size)?;
+        for part in upload.part_info_list {
+            let offset = (part.part_number - 1) * PART_SIZE;
+            send_part(
+                &self.api.http,
+                &part,
+                &mut file,
+                offset,
+                (size - offset).min(PART_SIZE),
+                &progress,
+            )
+            .await?;
+        }
+        let after = file.metadata().await?;
+        if after.len() != size || after.modified().ok() != metadata.modified().ok() {
+            bail!("The local file changed during the upload");
+        }
+        let completed: serde_json::Value = self
+            .call(
+                "complete",
+                json!({
+                    "drive_id": self.id, "file_id": upload.file_id, "upload_id": upload_id,
+                }),
+            )
+            .await?;
+        progress.finish_and_clear();
+        Ok(completed["name"]
             .as_str()
-            .ok_or_else(|| anyhow!("Missing upload_url"))?;
-        let part_number = part["part_number"].as_u64().unwrap_or(0);
-        let start = (i * PART_SIZE) as u64;
-        let end = ((i + 1) * PART_SIZE).min(file_size as usize) as u64;
-        let chunk_size = (end - start) as usize;
+            .or_else(|| completed["file_name"].as_str())
+            .map(str::to_owned)
+            .or(upload.file_name)
+            .or(upload.name)
+            .unwrap_or_else(|| name.to_owned()))
+    }
+}
 
-        // 读取分片数据
-        file.seek(SeekFrom::Start(start))?;
-        let mut buf = vec![0u8; chunk_size];
-        file.read_exact(&mut buf)?;
-
-        let mut retry_count = 0;
-        loop {
-            // 创建进度追踪流
-            let stream = ProgressStream::new(buf.clone(), pb.clone());
-            let body = Body::wrap_stream(stream);
-
-            let put_res = client
-                .put(upload_url)
-                .header("Content-Length", chunk_size.to_string())
-                .body(body)
-                .send()
-                .await;
-
-            match put_res {
-                Ok(r) if r.status().is_success() => {
-                    break;
+async fn send_part(
+    http: &Client,
+    part: &Part,
+    file: &mut File,
+    offset: u64,
+    length: u64,
+    progress: &ProgressBar,
+) -> Result<()> {
+    for attempt in 0..ATTEMPTS {
+        progress.set_position(offset);
+        let mut request = http
+            .put(part.upload_url.clone())
+            .header(CONTENT_LENGTH, length);
+        if length > 0 {
+            file.seek(SeekFrom::Start(offset)).await?;
+            let stream_progress = progress.clone();
+            let stream =
+                ReaderStream::with_capacity(file.try_clone().await?.take(length), 64 * 1024)
+                    .inspect_ok(move |bytes| stream_progress.inc(bytes.len() as u64));
+            request = request.body(Body::wrap_stream(stream));
+        }
+        match request.send().await {
+            Ok(response) if response.status().is_success() => {
+                if progress.position() != offset + length {
+                    bail!("Part {} ended before all bytes were sent", part.part_number);
                 }
-                Ok(r) if r.status().as_u16() == 403 && retry_count < 3 => {
-                    // 回退进度条（因为这次上传失败了）
-                    pb.set_position(pb.position().saturating_sub(chunk_size as u64));
-                    eprintln!("⚠️ Concurrency limit hit, retrying in 3 s...");
-                    retry_count += 1;
-                    sleep(Duration::from_secs(3)).await;
-                }
-                Ok(r) => {
-                    pb.set_position(pb.position().saturating_sub(chunk_size as u64));
-                    return Err(anyhow!(
-                        "Part {} upload failed: {}",
-                        part_number,
-                        r.text().await?
-                    ));
-                }
-                Err(e) if retry_count < 3 => {
-                    pb.set_position(pb.position().saturating_sub(chunk_size as u64));
-                    eprintln!("⚠️ Network error: {}, retrying in 3 s...", e);
-                    retry_count += 1;
-                    sleep(Duration::from_secs(3)).await;
-                }
-                Err(e) => {
-                    pb.set_position(pb.position().saturating_sub(chunk_size as u64));
-                    return Err(anyhow!("Upload failed: {}", e));
-                }
+                return Ok(());
+            }
+            Ok(response) if attempt + 1 < ATTEMPTS && retry_status(response.status()) => {}
+            Ok(response) => bail!(
+                "Upload part {}: HTTP {}",
+                part.part_number,
+                response.status()
+            ),
+            Err(_) if attempt + 1 < ATTEMPTS => {}
+            Err(err) => {
+                return Err(err.without_url())
+                    .with_context(|| format!("upload part {}", part.part_number))
             }
         }
+        retry_delay(attempt).await;
     }
+    unreachable!("the final attempt returns a result");
+}
 
-    pb.finish_with_message("✅ Upload complete, finalizing...");
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        api::Api,
+        test_server::{json_reply, request_json, TestServer},
+    };
+    use std::{
+        fs,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+    };
 
-    // 4️⃣ Complete upload
-    let complete_url = "https://openapi.alipan.com/adrive/v1.0/openFile/complete";
-    let complete_body = json!({
-        "drive_id": drive_id,
-        "file_id": file_id,
-        "upload_id": upload_id
-    });
-
-    let res2 = client
-        .post(complete_url)
-        .bearer_auth(token)
-        .json(&complete_body)
-        .send()
-        .await?;
-    let status = res2.status();
-    let text = res2.text().await?;
-    if status.is_success() {
-        println!("🎉 File uploaded successfully!");
-        println!("✅ Upload success!");
-    } else {
-        return Err(anyhow!("Upload completion failed: {}", text));
+    #[tokio::test]
+    async fn retries_stream_and_finalizes_including_empty_files() {
+        let sent = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&sent);
+        let server = TestServer::start(move |request, origin| {
+            match request.uri().path() {
+                "/adrive/v1.0/openFile/create" => {
+                    let body = request_json(&request);
+                    assert_eq!(body["part_info_list"], json!([{"part_number": 1}]));
+                    assert_eq!(body["size"], if body["name"] == "empty" { 0 } else { 7 });
+                    json_reply(json!({
+                        "file_id": body["name"], "upload_id": "upload", "name": "saved",
+                        "part_info_list": [{"part_number": 1, "upload_url": format!("{origin}/{}", body["name"].as_str().unwrap())}]
+                    }))
+                }
+                "/file" | "/empty" => {
+                    assert_eq!(request.method(), "PUT");
+                    assert!(!request.headers().contains_key("authorization"));
+                    if request.uri().path() == "/file" {
+                        assert_eq!(request.body().as_ref(), b"content");
+                        if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                            return hyper::Response::builder()
+                                .status(503)
+                                .body(http_body_util::Full::default())
+                                .unwrap();
+                        }
+                    } else {
+                        assert!(request.body().is_empty());
+                    }
+                    json_reply(json!(null))
+                }
+                "/adrive/v1.0/openFile/complete" => {
+                    assert_eq!(request_json(&request)["upload_id"], "upload");
+                    json_reply(json!({"name": "saved"}))
+                }
+                path => panic!("unexpected request: {path}"),
+            }
+        }).await;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("file");
+        fs::write(&path, b"content").unwrap();
+        let api = Api::for_test(&server.origin);
+        let drive = Drive::new(&api, "token", "drive");
+        assert_eq!(drive.upload("root", "file", &path).await.unwrap(), "saved");
+        assert_eq!(sent.load(Ordering::SeqCst), 2);
+        fs::write(&path, []).unwrap();
+        assert_eq!(drive.upload("root", "empty", &path).await.unwrap(), "saved");
     }
-
-    Ok(())
 }
